@@ -106,7 +106,7 @@ def load_model(path, backend, device):
 def generate(model, tok, prompt_ids, mode, max_new_tokens, backend):
     if backend == "hf":
         out = model.generate(input_ids=prompt_ids, attention_mask=torch.ones_like(prompt_ids),
-                             max_new_tokens=max_new_tokens, do_sample=False)
+                             max_new_tokens=max_new_tokens, max_length=None, do_sample=False)
         return out, out.shape[1] - prompt_ids.shape[1]
     if mode == "ar":
         return model.ar_generate(prompt_ids, max_new_tokens=max_new_tokens, eos_token_id=tok.eos_token_id)
@@ -137,7 +137,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     t0 = time.time()
-    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tok_kwargs = {"fix_mistral_regex": True} if "mistral" in args.model.lower() else {}
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, **tok_kwargs)
     model = load_model(args.model, args.backend, device)
     print(f"loaded {args.model} on {device} in {time.time() - t0:.1f}s", flush=True)
 
