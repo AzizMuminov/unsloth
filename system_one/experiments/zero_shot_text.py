@@ -5,13 +5,19 @@ a chat prompt, the model generates a short text answer, and we parse it back
 into the typed answer (bool / option key / level index). This measures how
 much decision ability the backbone has out of the box.
 
-Decoding modes (Nemotron-Labs-Diffusion is tri-mode):
+Decoding modes (Nemotron-Labs-Diffusion is tri-mode; plain LLMs use `ar`):
   dlm_bi  diffusion decoding, prompt read bidirectionally (causal_context=False)
   dlm     diffusion decoding, prompt prefilled causally (the model's default)
   ar      ordinary autoregressive decoding
 
+Prompt repetition (--repeats 1,2): with 2 the user message is pasted twice.
+In a causal model the second copy can attend to the whole first copy, a cheap
+stand-in for bidirectional reading (Leviathan et al., "Prompt Repetition
+Improves Non-Reasoning LLMs").
+
 Usage:
-  python zero_shot_text.py --model PATH_OR_REPO [--modes dlm_bi,dlm,ar] [--ids n1,c2]
+  python zero_shot_text.py --model PATH --backend nld --modes dlm,ar --repeats 1,2
+  python zero_shot_text.py --model PATH --backend hf --repeats 1,2
 """
 
 import argparse
@@ -23,7 +29,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForImageTextToText, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent))
 from zero_shot_cases import CASES  # noqa: E402
@@ -86,7 +92,22 @@ def parse_answer(text, q):
         return None
 
 
-def generate(model, tok, prompt_ids, mode, max_new_tokens):
+def load_model(path, backend, device):
+    if backend == "nld":
+        return AutoModel.from_pretrained(path, trust_remote_code=True, dtype=torch.bfloat16).to(device).eval()
+    kwargs = {}
+    config = json.load(open(Path(path) / "config.json")) if Path(path).is_dir() else {}
+    if config.get("quantization_config", {}).get("quant_method") == "fp8" and device == "cpu":
+        from transformers import FineGrainedFP8Config
+        kwargs["quantization_config"] = FineGrainedFP8Config(dequantize=True)
+    return AutoModelForImageTextToText.from_pretrained(path, dtype=torch.bfloat16, **kwargs).to(device).eval()
+
+
+def generate(model, tok, prompt_ids, mode, max_new_tokens, backend):
+    if backend == "hf":
+        out = model.generate(input_ids=prompt_ids, attention_mask=torch.ones_like(prompt_ids),
+                             max_new_tokens=max_new_tokens, do_sample=False)
+        return out, out.shape[1] - prompt_ids.shape[1]
     if mode == "ar":
         return model.ar_generate(prompt_ids, max_new_tokens=max_new_tokens, eos_token_id=tok.eos_token_id)
     return model.generate(
@@ -102,7 +123,9 @@ def generate(model, tok, prompt_ids, mode, max_new_tokens):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--modes", default="dlm_bi,dlm,ar")
+    ap.add_argument("--backend", choices=["nld", "hf"], default="nld")
+    ap.add_argument("--modes", default="ar")
+    ap.add_argument("--repeats", default="1", help="comma-separated prompt repeat counts, e.g. 1,2")
     ap.add_argument("--ids", default=None, help="comma-separated case ids to run")
     ap.add_argument("--max-new-tokens", type=int, default=16)
     ap.add_argument("--threads", type=int, default=None)
@@ -115,36 +138,39 @@ def main():
 
     t0 = time.time()
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModel.from_pretrained(args.model, trust_remote_code=True, dtype=torch.bfloat16).to(device).eval()
+    model = load_model(args.model, args.backend, device)
     print(f"loaded {args.model} on {device} in {time.time() - t0:.1f}s", flush=True)
 
     cases = CASES
     if args.ids:
         wanted = set(args.ids.split(","))
         cases = [c for c in CASES if c["id"] in wanted]
-    modes = args.modes.split(",")
+    variants = [(m, int(r)) for m in args.modes.split(",") for r in args.repeats.split(",")]
 
     results = []
     for case in cases:
-        messages = [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": build_prompt(case["state"], case["q"])},
-        ]
-        prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        prompt_ids = tok(prompt, return_tensors="pt").input_ids.to(device)
-        for mode in modes:
+        user = build_prompt(case["state"], case["q"])
+        for mode, repeat in variants:
+            messages = [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": "\n\n".join([user] * repeat)},
+            ]
+            prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                             enable_thinking=False)
+            prompt_ids = tok(prompt, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
             t = time.time()
-            out_ids, nfe = generate(model, tok, prompt_ids, mode, args.max_new_tokens)
+            out_ids, nfe = generate(model, tok, prompt_ids, mode, args.max_new_tokens, args.backend)
             dt = time.time() - t
             text = tok.decode(out_ids[0, prompt_ids.shape[1]:], skip_special_tokens=True)
             ans = parse_answer(text, case["q"])
             ok = ans == case["gold"]
-            r = dict(id=case["id"], type=case["q"]["type"], tag=case["tag"], mode=mode,
-                     gold=case["gold"], answer=ans, ok=ok, parsed=ans is not None,
+            name = f"{mode}x{repeat}"
+            r = dict(id=case["id"], type=case["q"]["type"], tag=case["tag"], mode=mode, repeat=repeat,
+                     variant=name, gold=case["gold"], answer=ans, ok=ok, parsed=ans is not None,
                      text=text, nfe=nfe, seconds=round(dt, 3), prompt_tokens=prompt_ids.shape[1])
             results.append(r)
             flag = "OK  " if ok else ("FAIL" if ans is not None else "PARSE")
-            print(f"[{flag}] {case['id']:<4} {mode:<6} gold={case['gold']!s:<10} got={ans!s:<10} "
+            print(f"[{flag}] {case['id']:<4} {name:<8} gold={case['gold']!s:<10} got={ans!s:<10} "
                   f"nfe={nfe:<3} {dt:5.2f}s  text={text.strip()[:60]!r}", flush=True)
 
     if args.out:
@@ -154,13 +180,13 @@ def main():
 
     # Summary: accuracy per mode, by question type and by tag.
     print("\n=== summary ===")
-    for mode in modes:
-        rs = [r for r in results if r["mode"] == mode]
+    for name in dict.fromkeys(r["variant"] for r in results):
+        rs = [r for r in results if r["variant"] == name]
         acc = sum(r["ok"] for r in rs) / len(rs)
         parse = sum(r["parsed"] for r in rs) / len(rs)
         lat = sum(r["seconds"] for r in rs) / len(rs)
-        nfe = sum(r["nfe"] for r in rs) / len(rs)
-        print(f"{mode:<6} acc={acc:.2%} parsed={parse:.0%} mean_latency={lat:.2f}s mean_nfe={nfe:.1f}")
+        toks = sum(r["prompt_tokens"] for r in rs) / len(rs)
+        print(f"{name:<8} acc={acc:.2%} parsed={parse:.0%} mean_latency={lat:.2f}s mean_prompt_tokens={toks:.0f}")
         for key in ("type", "tag"):
             groups = defaultdict(list)
             for r in rs:
